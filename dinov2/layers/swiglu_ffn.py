@@ -34,22 +34,11 @@ class SwiGLUFFN(nn.Module):
         return self.w3(hidden)
 
 
-XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
-try:
-    if XFORMERS_ENABLED:
-        from xformers.ops import SwiGLU
-
-        XFORMERS_AVAILABLE = True
-        warnings.warn("xFormers is available (SwiGLU)")
-    else:
-        warnings.warn("xFormers is disabled (SwiGLU)")
-        raise ImportError
-except ImportError:
+XFORMERS_ENABLED = os.environ.get("DINO_USE_XFORMERS").lower() == "true"
+if XFORMERS_ENABLED:
+    from xformers.ops import SwiGLU
+else:
     SwiGLU = SwiGLUFFN
-    XFORMERS_AVAILABLE = False
-
-    warnings.warn("xFormers is not available (SwiGLU)")
-
 
 class SwiGLUFFNFused(SwiGLU):
     def __init__(

@@ -9,8 +9,10 @@
 
 import logging
 import os
-import warnings
+from contextlib import contextmanager
 
+import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch import nn
 
@@ -18,19 +20,21 @@ from torch import nn
 logger = logging.getLogger("dinov2")
 
 
-XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
-try:
-    if XFORMERS_ENABLED:
-        from xformers.ops import memory_efficient_attention, unbind
+XFORMERS_ENABLED = os.environ.get("DINO_USE_XFORMERS").lower() == "true"
+if XFORMERS_ENABLED:
+    from xformers.ops import memory_efficient_attention, unbind
 
-        XFORMERS_AVAILABLE = True
-        warnings.warn("xFormers is available (Attention)")
-    else:
-        warnings.warn("xFormers is disabled (Attention)")
-        raise ImportError
-except ImportError:
-    XFORMERS_AVAILABLE = False
-    warnings.warn("xFormers is not available (Attention)")
+# By default it will use the best available attention implementation,
+# but if you want to ensure it uses Flash, use this environment variable
+FORCE_FLASH = os.environ.get("DINO_FORCE_FLASH_ATTENTION").lower() == "true"
+@contextmanager
+def flash_attention(force=False):
+    try:
+        torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=not force, enable_mem_efficient=not force)
+        yield
+    finally:
+        # Reset to default settings if needed
+        torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
 
 
 class Attention(nn.Module):
@@ -49,7 +53,7 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_drop = attn_drop
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
@@ -58,10 +62,10 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        attn = q @ k.transpose(-2, -1)
 
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        attn_drop_p = self.attn_drop if self.training else 0.0
+        with flash_attention(force=FORCE_FLASH):
+            attn = F.scaled_dot_product_attention(q, k, v, scale=self.scale, dropout_p=attn_drop_p)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -71,7 +75,7 @@ class Attention(nn.Module):
 
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        if not XFORMERS_AVAILABLE:
+        if not XFORMERS_ENABLED:
             if attn_bias is not None:
                 raise AssertionError("xFormers is required for using nested tensors")
             return super().forward(x)
